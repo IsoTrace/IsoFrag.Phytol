@@ -25,3 +25,7 @@ It implements the workflow described in *DOI*.
 1. Clone this repository:
    ```bash
    git clone https://github.com/YOURNAME/phytol-orbitrap.git
+
+2. If you use this code, please cite:
+[DOI]
+Kantnerová et al. 2024 (IsoOrbi R package)

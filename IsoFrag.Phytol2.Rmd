@@ -1,0 +1,1233 @@
+---
+title: "IsoFrag Phytol – Comparative Isotopomics Workflow"
+author: "Merve Tomečková Öztoprak"
+output: html_document
+date: "2026-02-17"
+---
+### Background
+
+This R Markdown document reproduces the isotope ratio analysis of fragments of **Phytol** generated from the **M+1 ion beam** in an **MS² experiment** (HCD fragmentation) using an Orbitrap Mass Spectrometer.
+
+Phytol was infused under constant flow with sufficient equilibration prior to acquisition.  
+Raw Orbitrap files must be converted to **IsoX (.isox)** format before analysis.
+
+Functions are adapted from and conceptually based on the R package **isoorbi**.  
+For more information see: https://isoorbi.isoverse.org
+
+This document performs:
+
+1. MS1 M+1 precursor reconstruction  
+2. MS2 fragment ρ¹³C determination  
+3. Hydrogen correction using MS1-derived precursor  
+4. Sample vs. standard comparison  
+5. Heterogeneous vs homogeneous carbon model comparison  
+6. Variance partitioning analysis  
+
+---
+
+### Project Structure
+
+Place this Rmd file in your project root folder.
+
+This R Markdown file combines MS1 and MS2 phytol isotomics analysis workflows. The folder structure required is:
+
+```
+project/
+├── IsoFrag_Phytol.Rmd
+├── InputMS1/
+│   └── *.isox files
+├── InputMS2/
+│   └── *.isox files
+├── dependencies/
+│   ├── customfunctions.R
+│   ├── isotopologs.tsv
+│   └── sample_info.csv
+└── output/
+    (generated files)
+```
+
+All output files are saved to the `output/` directory. Visualizations for precision comparisons, 2H correction comparisons, and day-to-day variability are displayed in the notebook but not saved automatically.
+
+All paths are relative and GitHub-compatible.
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Create output directory if it doesn't exist
+if(!dir.exists("output")) dir.create("output")
+```
+
+## 1. Package Management
+
+This section loads all required packages for the analysis.
+
+```{r packages}
+required_packages <- c(
+  "plyr", "dplyr", "ggplot2", "tidyverse", "cowplot", "data.table", 
+  "ggExtra", "gridExtra", "isoorbi", "scales", "readxl", "openxlsx", 
+  "forstringr", "purrr", "utils", "rlang", "vegan", "corrr", 
+  "ggcorrplot", "ggbiplot", "ComplexHeatmap", "circlize", "RColorBrewer", 
+  "ggforce", "corrplot", "factoextra", "FactoMineR", "gt", "minpack.lm", 
+  "nnet", "car", "lmtest", "lme4"
+)
+
+# Function to load/install packages
+load_packages <- function(packages) {
+  lapply(packages, function(x) {
+    if (!require(x, character.only = TRUE)) {
+      install.packages(x, dependencies = TRUE, repos = "http://cran.us.r-project.org")
+      library(x, character.only = TRUE)
+    }
+  })
+  invisible()
+}
+
+load_packages(required_packages)
+```
+
+## 2. Custom Functions
+
+All custom functions are sourced from the dependencies folder.
+
+```{r custom-functions}
+source("dependencies/customfunctions.R")
+```
+
+## 3. Data Import Functions
+
+Helper functions for importing and processing raw data.
+
+```{r import-functions}
+# Import MS1 or MS2 .isox files
+import_data <- function(filepath) {
+  raw.files <- tibble(filepath = list.files(filepath, pattern = "*.isox", full.names = TRUE))
+  
+  raw.files %>%
+    mutate(filename = trimws(filepath, whitespace = ".*\\/")) %>%
+    relocate(filename) %>%
+    rowwise() %>%
+    do(., orbi_read_isox(file = .$filepath))
+}
+
+# Generate summary statistics for raw data
+process_raw_data <- function(raw.data) {
+  raw.data %>%
+    rename(isotopolog = isotopocule) %>%
+    group_by(filename) %>%
+    summarise(
+      no.scans = length(unique(scan.no)),
+      time = max(time.min),
+      compound = length(unique(compound)),
+      isotopolog = length(unique(isotopolog)),
+      m.resolution = mean(resolution),
+      m.microscans = mean(microscans),
+      m.AGC = mean(agcTarget)
+    )
+}
+```
+
+## 4. MS1 Data Processing
+
+### 4.1 Import MS1 Data
+
+```{r ms1-import}
+# Import sample information
+sample_info <- read.csv("dependencies/sample_info.csv", header = TRUE, sep = ",")
+
+# Import MS1 data
+ms1_raw <- import_data("InputMS1")
+
+# Resolve 17O/13C overlap (keep 13C, drop 17O duplicate)
+ms1_raw <- ms1_raw %>%
+  group_by(filename, scan.no, compound) %>%
+  arrange(isotopocule, .by_group = TRUE) %>%
+  filter(!(isotopocule == "17O" & duplicated(intensity) & duplicated(mzMeasured))) %>%
+  ungroup()
+
+# Merge with theoretical masses
+main_mz_ms1 <- read.table("dependencies/isotopologs.tsv", header = FALSE)
+colnames(main_mz_ms1) <- c("compound", "isotopocule", "m_z", "tolerance [mmu]", "z")
+ms1_raw <- merge(ms1_raw, main_mz_ms1[, 1:3], by = c("compound", "isotopocule"))
+
+# MS1 summary statistics
+ms1_summary <- process_raw_data(ms1_raw)
+```
+
+### 4.2 MS1 Quality Control
+
+```{r ms1-qc}
+# Filter relevant isotopocules
+ms1_filtered <- ms1_raw %>%
+  filter(isotopocule %in% c("M0", "13C", "2H", "17O"))
+
+# Flag outliers, mass defects, and weak isotopocules
+ms1_flagged <- ms1_filtered %>%
+  orbi_flag_outliers_new(agc_sd_cutoff = 3) %>%
+  orbi_flag_mass.def_peaks() %>%
+  orbi_flag_weak_isotopocules(min_percent = 90)
+
+# Generate metadata flags
+ms1_meta <- ms1_flagged %>%
+  group_by(filename, compound, isotopocule) %>%
+  mutate(max.scan.no = max(scan.no)) %>%
+  summarize(
+    prcnt.TIC = sum(intensity) / sum(tic) * 100,
+    prcnt.outlier = length(which(is_outlier == TRUE)) / n() * 100,
+    prcnt.satellite = length(which(is_main_mz == FALSE)) / n() * 100,
+    prcnt.coverage = length(unique(scan.no)) / mean(max.scan.no) * 100
+  ) %>%
+  ungroup()
+
+# Apply final filtering
+ms1_clean <- ms1_flagged %>%
+  filter(is_main_mz == TRUE, is_outlier == FALSE, is_weak_isotopocule == FALSE) %>%
+  group_by(filename, compound, scan.no) %>%
+  filter(any(isotopocule == "M0")) %>%
+  ungroup() %>%
+  group_by(filename, compound, isotopocule, scan.no) %>%
+  filter(ions.incremental == max(ions.incremental)) %>%
+  ungroup()
+```
+
+### 4.3 MS1 Abundance Calculations
+
+```{r ms1-abundance}
+# Calculate Nio values
+ms1_dataset <- ms1_clean %>%
+  filter(isotopocule %in% c("13C", "M0", "2H", "17O")) %>%
+  droplevels() %>%
+  mutate(
+    element = case_when(
+      isotopocule == "M0" ~ "U",
+      isotopocule == "13C" ~ "C",
+      isotopocule == "2H" ~ "H",
+      isotopocule == "17O" ~ "O",
+      TRUE ~ str_extract(isotopocule, "(?<=\\d)[A-Za-z]+")
+    ),
+    Nio = ((intensity / peakNoise) * (4.4 / 1)) * 
+          ((120000 / resolution)^0.5) * (microscans^0.5)
+  ) %>%
+  select(filename, compound, element, isotopocule, scan.no, Nio)
+
+# Calculate mean Nio values per file and compound
+ms1_means <- ms1_dataset %>%
+  group_by(filename, compound) %>%
+  summarise(
+    m.M0.Nio = mean(Nio[isotopocule == "M0"], na.rm = TRUE),
+    ae.M0.Nio = (sd(Nio[isotopocule == "M0"], na.rm = TRUE) / 
+                  sqrt(sum(isotopocule == "M0"))) * 
+                 (1 / mean(Nio[isotopocule == "M0"], na.rm = TRUE)),
+    m.M1.Nio = mean(Nio[isotopocule == "13C"], na.rm = TRUE),
+    ae.M1.Nio = (sd(Nio[isotopocule == "13C"], na.rm = TRUE) / 
+                  sqrt(sum(isotopocule == "13C"))) * 
+                 (1 / mean(Nio[isotopocule == "13C"], na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  complete(filename, compound)
+```
+
+### 4.4 Theoretical MS1 Calculations
+
+```{r ms1-theoretical}
+# Constants
+VPDB <- 0.011113
+SMOW17O <- 0.0003799
+SMOW18O <- 0.0020672
+SMOW2H <- 0.00015575
+
+# Merge with sample information
+ms1_theory <- merge(
+  ms1_means %>% filter(compound == "C20H39O"),
+  sample_info[, c("filename", "deltaC", "deltaH", "deltaO", "deltaAPCI", "deltaOH")],
+  by = "filename"
+) %>%
+  mutate(
+    n.C = as.numeric(str_extract(compound, "(?<=C)\\d+")),
+    n.H = as.numeric(str_extract(compound, "(?<=H)\\d+")),
+    n.O = ifelse(str_detect(compound, "O"), 1, 0),
+    
+    # Isotope ratios
+    R.13C = VPDB * (1 + deltaC / 1000),
+    R.2H = SMOW2H * (1 + deltaH / 1000),
+    R.17O = SMOW17O * (1 + deltaO / 1000),
+    R.APCI = SMOW2H * (1 + deltaAPCI / 1000),
+    R.OH = SMOW2H * (1 + deltaOH / 1000),
+    
+    # Theoretical M+1 probabilities
+    U.M1.theory.C20H40O = 20 * R.13C + 39 * R.2H + 1 * R.OH + 1 * R.17O,
+    U.M1.theory.C20H39O = 20 * R.13C + 37 * R.2H + 1 * R.APCI + 1 * R.OH + 1 * R.17O,
+    
+    # Observed MS1 M+1 abundance
+    U.M1.MS1 = m.M1.Nio / m.M0.Nio,
+    se.U.M1.MS1 = U.M1.MS1 * sqrt(ae.M1.Nio^2 + ae.M0.Nio^2),
+    
+    # Diagnostic difference
+    delta.U.M1.C20H39O = abs(U.M1.MS1 - U.M1.theory.C20H39O)
+  )
+```
+
+### 4.5 MS1 Final Table
+
+```{r ms1-output}
+# Create and save the all.table needed for MS2 analysis
+all.table <- ms1_theory %>%
+  select(
+    filename, compound, deltaC, deltaH, R.13C, R.2H, R.17O, R.APCI, R.OH,
+    U.M1.theory.C20H40O, U.M1.theory.C20H39O, U.M1.MS1, se.U.M1.MS1, delta.U.M1.C20H39O
+  )%>%
+  mutate(ID = case_when(
+    filename == "H2210022" ~ "STD",
+    filename == "H2210033" ~ "CHLA",
+    TRUE ~ "Spinach" # Default value if no condition is met
+  ))
+
+write.xlsx(all.table, "output/table.MS1.xlsx")
+```
+
+## 5. MS2 Data Processing
+
+### 5.1 Import MS2 Data
+
+```{r ms2-import}
+# Import MS2 data
+ms2_raw <- import_data("InputMS2")
+
+# Merge with theoretical masses
+main_mz_ms2 <- read.table("dependencies/isotopologs.tsv", header = FALSE)
+colnames(main_mz_ms2) <- c("compound", "isotopocule", "m_z", "tolerance [mmu]", "z")
+ms2_raw <- merge(ms2_raw, main_mz_ms2[, 1:3], by = c("compound", "isotopocule"))
+
+# MS2 summary statistics
+ms2_summary <- process_raw_data(ms2_raw)
+```
+
+### 5.2 MS2 Quality Control
+
+```{r ms2-qc}
+# Filter isotopocules and compounds
+ms2_filtered <- ms2_raw %>%
+  filter(isotopocule %in% c("M0", "13C", "2H")) %>%
+  filter(!compound %in% c("C20H37", "C20H39O", "C20H40O"))
+
+# Flag outliers, mass defects, and weak isotopocules
+ms2_flagged <- ms2_filtered %>%
+  orbi_flag_outliers_new(agc_sd_cutoff = 3) %>%
+  orbi_flag_mass.def_peaks() %>%
+  orbi_flag_weak_isotopocules(min_percent = 90)
+
+# Apply filtering criteria
+ms2_clean <- ms2_flagged %>%
+  filter(
+    is_outlier == FALSE,
+    is_weak_isotopocule == FALSE | !isotopocule %in% c("M0")
+  ) %>%
+  group_by(filename, compound, scan.no) %>%
+  filter(any(isotopocule == "M0")) %>%
+  ungroup() %>%
+  group_by(filename, compound, isotopocule, scan.no) %>%
+  slice_max(ions.incremental, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  filter(!compound %in% c("C20H37", "C20H39O", "C20H40O"))
+```
+
+### 5.3 MS2 Quality Control Metadata
+
+```{r ms2-meta}
+# Generate metadata flags for supplementary tables
+meta.flag.data <- ms2_flagged %>%
+  group_by(filename, compound, isotopocule) %>%
+  summarize(
+    n = n(),
+    prcnt.TIC = sum(intensity) / sum(tic) * 100,
+    prcnt.outlier = length(which(is_outlier == TRUE)) / n() * 100,
+    prcnt.satellite = length(which(is_main_mz == FALSE)) / n() * 100,
+    prcnt.coverage = length(unique(scan.no)) / max(scan.no) * 100,
+    .groups = "drop"
+  )
+
+meta.flag.data$isotopocule <- factor(meta.flag.data$isotopocule, 
+                                      levels = c("M0", "13C", "2H"))
+
+# Supplementary Table 1 (oxygenated fragments)
+sup.tab.1 <- meta.flag.data %>%
+  merge(., sample_info[, 1:3], by = "filename") %>%
+  filter(filename %in% c("H2210046"), grepl("O", compound)) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = isotopocule,
+    values_from = c(prcnt.TIC, prcnt.outlier, prcnt.satellite, prcnt.coverage),
+    names_sep = "."
+  ) %>%
+  group_by(filename, ID, compound) %>%
+  summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)), .groups = "drop") %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+
+# Supplementary Table 2 (non-oxygenated fragments)
+sup.tab.2 <- meta.flag.data %>%
+  merge(., sample_info[, 1:3], by = "filename") %>%
+  filter(filename %in% c("H2210046"), !grepl("O", compound)) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = isotopocule,
+    values_from = c(prcnt.TIC, prcnt.outlier, prcnt.satellite, prcnt.coverage),
+    names_sep = "."
+  ) %>%
+  group_by(filename, ID, compound) %>%
+  summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)), .groups = "drop") %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+
+# Coverage table
+coverage <- meta.flag.data %>%
+  merge(., sample_info[, 1:3], by = "filename") %>%
+  filter(!compound %in% c("C20H37", "C20H39O", "C20H40O")) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = isotopocule,
+    values_from = c(prcnt.TIC, prcnt.outlier, prcnt.satellite, prcnt.coverage),
+    names_sep = "."
+  ) %>%
+  group_by(filename, compound) %>%
+  summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+
+# Save supplementary tables
+write.xlsx(sup.tab.1, "output/sup.tab.1.xlsx")
+write.xlsx(sup.tab.2, "output/sup.tab.2.xlsx")
+```
+
+### 5.4 MS2 Abundance Calculations
+
+```{r ms2-abundance}
+# Calculate Nio values and extract carbon/hydrogen numbers
+ms2_dataset <- ms2_clean %>%
+  mutate(
+    element = str_extract(isotopocule, "(?<=\\d)\\p{L}+"),
+    Nio = ((intensity / peakNoise) * (4.4 / 1)) * 
+          ((120000 / resolution)^0.5) * (microscans^0.5),
+    n.C = as.numeric(str_extract(compound, "(?<=C)\\d+")),
+    n.H = as.numeric(str_extract(compound, "(?<=H)\\d+"))
+  ) %>%
+  select(filename, compound, n.C, n.H, isotopocule, scan.no, Nio)
+
+# Naive approach (treat missing 2H as 0)
+data_ro.naive <- ms2_dataset %>%
+  complete(nesting(filename, compound, scan.no), isotopocule, 
+           fill = list(Nio = NA), explicit = FALSE) %>%
+  group_by(filename, compound, isotopocule) %>%
+  split(.$isotopocule) %>%
+  as.data.frame() %>%
+  rename(filename = M0.filename, compound = M0.compound, scan.no = M0.scan.no) %>%
+  select(filename, compound, scan.no, ends_with(".Nio")) %>%
+  mutate(
+    ro_denom.sum = rowSums(select(., ends_with(".Nio")), na.rm = TRUE),
+    ro.13C = X13C.Nio / ro_denom.sum,
+    ro.2H = X2H.Nio / ro_denom.sum,
+    ro.M0 = M0.Nio / ro_denom.sum,
+    ro.13C.noH = X13C.Nio / (X13C.Nio + M0.Nio)
+  ) %>%
+  group_by(filename, compound) %>%
+  mutate(
+    shotnoise.H = ((sum(na.omit(M0.Nio)) + sum(na.omit(X13C.Nio))) / 
+                     (sum(na.omit(X2H.Nio)) + sum(na.omit(M0.Nio)) + sum(na.omit(X13C.Nio)))) *
+      sqrt((1 / sum(na.omit(X2H.Nio))) + (1 / (sum(na.omit(M0.Nio)) + sum(na.omit(X13C.Nio))))),
+    shotnoise.C = ((sum(na.omit(M0.Nio)) + sum(na.omit(X2H.Nio))) / 
+                     (sum(na.omit(X13C.Nio)) + sum(na.omit(M0.Nio)) + sum(na.omit(X2H.Nio)))) *
+      sqrt((1 / sum(na.omit(X13C.Nio))) + (1 / (sum(na.omit(M0.Nio)) + sum(na.omit(X2H.Nio)))))
+  ) %>%
+  ungroup()
+```
+
+### 5.5 MS2 Statistics
+
+```{r ms2-stats}
+# Calculate summary statistics
+calculate_stats <- function(data, method_name, iso_pattern = "ro.", elements = c("M0", "13C", "2H")) {
+  # Validate inputs
+  stopifnot(is.data.frame(data))
+  stopifnot(is.character(method_name), length(method_name) == 1)
+  
+  # Process data
+  result <- data %>%
+    group_by(filename, compound, shotnoise.H, shotnoise.C) %>%
+    summarise(
+      method = method_name,
+      across(starts_with(iso_pattern), 
+             list(
+               m = ~ mean(.x, na.rm = TRUE),
+               sd = ~ sd(.x, na.rm = TRUE),
+               se = ~ sd(.x, na.rm = TRUE) / sqrt(n()),
+               ae = ~ (sd(.x, na.rm = TRUE) / sqrt(n())) * (1 / mean(.x, na.rm = TRUE))
+             ),
+             .names = "{col}.{.fn}"
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      across(where(is.numeric), ~ ifelse(is.nan(.), NA, .)),
+      sum.ro = rowSums(across(ends_with(".m")), na.rm = TRUE),
+      SNL.H.test = ifelse((ro.2H.ae / shotnoise.H) < 2, "pass", "fail"),
+      SNL.C.test = ifelse((ro.13C.ae / shotnoise.C) < 2, "pass", "fail"),
+      n.C = as.numeric(str_extract(compound, "(?<=C)\\d+")),
+      n.H = as.numeric(str_extract(compound, "(?<=H)\\d+")),
+      n.O = case_when(
+        str_detect(compound, "O\\d+") ~ as.numeric(str_extract(compound, "(?<=O)\\d+")),
+        str_detect(compound, "O") ~ 1,
+        TRUE ~ 0
+      )
+    ) %>%
+    filter(!sum.ro == 0)
+  
+  return(result)
+}
+
+# Calculate s_ro.naive if not already done
+s_ro.naive <- calculate_stats(data_ro.naive, "naive")
+
+```
+
+### 5.6 Shot noise limit check of individual fragments
+
+```{r viz-ae-snl, fig.height=8, fig.width=10}
+# AE/SNL comparison
+comp.ae_SNL <- data_ro.naive %>%
+  filter(filename == "H2210046") %>%
+  filter(!compound %in% c("C8H17", "C9H19", "C11H21", "C12H23", "C13H25", 
+                          "C14H27", "C9H17O", "C20H37", "C20H39O", "C20H40O")) %>%
+  arrange(compound, scan.no) %>%
+  group_by(compound) %>%
+  mutate(
+    cum_M0 = cumsum(replace_na(M0.Nio, 0)),
+    cum_13C = cumsum(replace_na(X13C.Nio, 0)),
+    cum_2H = cumsum(replace_na(X2H.Nio, 0)),
+    n_scan = row_number(),
+    shotnoise.C_cum = if_else(cum_13C > 0 & (cum_M0 + cum_2H) > 0,
+                              ((cum_M0 + cum_2H) / (cum_M0 + cum_13C + cum_2H)) *
+                                sqrt(1 / cum_13C + 1 / (cum_M0 + cum_2H)),
+                              NA_real_),
+    mean_13C_cum = map_dbl(n_scan, ~ mean(ro.13C[1:.x], na.rm = TRUE)),
+    sd_13C_cum = map_dbl(n_scan, ~ ifelse(.x > 1, sd(ro.13C[1:.x], na.rm = TRUE), NA_real_)),
+    ae_13C_cum = if_else(n_scan > 1 & mean_13C_cum > 0,
+                         (sd_13C_cum / sqrt(n_scan)) * (1 / mean_13C_cum),
+                         NA_real_),
+    AE_SN = ae_13C_cum / shotnoise.C_cum
+  ) %>%
+  ungroup()
+
+ggplot(comp.ae_SNL %>% 
+         mutate(C = as.integer(str_extract(compound, "(?<=C)\\d+"))) %>%
+         arrange(C) %>%
+         mutate(compound = factor(compound, levels = unique(compound))),
+       aes(x = scan.no, y = AE_SN)) +
+  geom_point(size = 1) +
+  ylim(1, 2) +
+  theme_bw() +
+  facet_wrap(~compound)
+```
+
+### 5.7 Isotope Correction Calculations
+
+```{r ms2-correction}
+# Create theoretical table by merging with sample_info and MS1_data
+ro.theory <- merge(
+  s_ro.naive[, c("filename", "compound", "shotnoise.H", "shotnoise.C", "n.C", "n.H", "n.O")],
+  sample_info[, c("filename", "ID", "deltaC", "deltaH", "deltaO", "deltaAPCI", "deltaOH")],
+  by = "filename"
+) %>%
+  merge(all.table[, c("ID", "R.13C", "R.2H", "R.17O", "R.APCI", "R.OH", 
+                      "U.M1.theory.C20H39O", "U.M1.MS1", "se.U.M1.MS1")], by = "ID")
+
+# Constants
+R_VPDB <- 0.011113
+delta.C.err <- 0.56 
+
+# Apply corrections
+s_ro.corr <- s_ro.naive %>%
+  # Filter unwanted compounds and files
+  filter(!compound %in% c("C8H17", "C9H19", "C11H21", "C12H23", "C13H25", "C14H27", "C9H17O")) %>%
+  filter(SNL.C.test == "pass") %>%
+  # Merge with theoretical data (excluding columns 4:12 from ro.theory)
+  merge(
+    ro.theory[, !names(ro.theory) %in% names(ro.theory)[4:12]],
+    by = c("filename", "compound")
+  ) %>%
+  # Merge with coverage data (columns 1,2,15 are filename, compound, prcnt.coverage.2H)
+  merge(
+    coverage[, c(1, 2, which(names(coverage) == "prcnt.coverage.2H"))],
+    by = c("filename", "compound")
+  ) %>%
+  # Merge with sample info for date and replicate
+  merge(
+    sample_info[, c("filename", "date", "replicate")],
+    by = "filename"
+  ) %>%
+  mutate(
+    prcnt.coverage.2H = ifelse(is.nan(prcnt.coverage.2H) | is.na(prcnt.coverage.2H), 
+                                0, prcnt.coverage.2H),
+    
+    # Calculate U.M1.MS1.ae
+    U_M1_MS1.ae = se.U.M1.MS1 / U.M1.MS1,
+    
+    # Hydrogen-anchored precursor reconstruction
+    U.2H.f = ifelse(grepl("O", compound),
+                    (n.H - 2) * R.2H + R.APCI + R.OH,
+                    (n.H - 1) * R.2H + R.APCI),
+    ro.2H.pred = U.2H.f / U.M1.MS1,
+    
+    # Corrected 13C abundance
+    ro.13C.corr = ro.13C.noH.m * (1 - ro.2H.pred),
+    ro.13C.corr.ae = ro.13C.ae,
+    
+    # Homogeneous model prediction
+    ro.13C.homo = (n.C * R.13C) / U.M1.MS1,
+    R.13C.err = R_VPDB * (delta.C.err / 1000),
+    R.13C.ae = R.13C.err / R.13C,
+    ro.13C.homo.ae = sqrt(R.13C.ae^2 + U_M1_MS1.ae^2)
+  ) %>%
+  mutate(
+    # Determine method based on 2H coverage
+    method = ifelse(prcnt.coverage.2H < 90, "exp_corr", "naive"),
+    
+    # Calculate degrees of unsaturation
+    DoU = ((2 * n.C + 2) - (n.H + 1)) / 2,
+    
+    # Assign groups based on unsaturation and oxygenation
+    Group = case_when(
+      DoU == 0 ~ "Mono-unsaturated",
+      DoU == 1 & grepl("O$", compound) ~ "Di-unsaturated (Oxygenated)",
+      DoU == 1 ~ "Di-unsaturated (Non-oxygenated)",
+      DoU == 2 ~ "Tri-unsaturated",
+      TRUE ~ "Other"
+    ),
+    
+    # Element type
+    element = ifelse(grepl("O", compound), "O", "C"),
+    
+    # Final 13C value (corrected or naive based on coverage)
+    ro.13C.value = ifelse(prcnt.coverage.2H < 90, ro.13C.corr, ro.13C.m),
+    ro.13C.value.ae = ifelse(prcnt.coverage.2H < 90, ro.13C.corr.ae, ro.13C.ae),
+    
+    # Calculate U.13C.f (fractional abundance at carbon sites)
+    U.13C.f = (ro.13C.value * U.M1.MS1) / n.C,
+    U.13C.f.ae = sqrt(ro.13C.value.ae^2 + U_M1_MS1.ae^2),
+    U.13C.f.se = U.13C.f * U.13C.f.ae
+  )
+
+# Check the resulting data frame
+glimpse(s_ro.corr)
+```
+
+### 5.8 Visualizations (Display Only)
+
+These plots are for visual inspection and will not be saved.
+
+```{r viz-compare-2h-correction, fig.height=6, fig.width=8}
+# Compare 2H correction
+ggplot(s_ro.corr %>% filter(filename == "H2210046", prcnt.coverage.2H >= 90),
+       aes(x = compound)) +
+  geom_point(aes(y = ro.13C.m), color = "black", size = 3,
+             position = position_nudge(x = -0.30)) +
+  geom_errorbar(aes(ymin = ro.13C.m - ro.13C.ae, ymax = ro.13C.m + ro.13C.ae),
+                width = 0.2, position = position_nudge(x = -0.30)) +
+  geom_point(aes(y = ro.13C.corr), color = "purple", size = 3,
+             position = position_nudge(x = 0.30)) +
+  geom_errorbar(aes(ymin = ro.13C.corr - ro.13C.corr.ae, 
+                    ymax = ro.13C.corr + ro.13C.corr.ae),
+                width = 0.2, position = position_nudge(x = 0.30), color = "purple") +
+  labs(title = expression("Observed vs corrected "*rho^{13}*"C"),
+       x = "Fragment", y = expression(rho^{13}*C)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### 5.9 Precision check
+
+```{r viz-precision, fig.height=10, fig.width=8}
+# Sample-standard precision
+precision_1 <- s_ro.corr %>%
+  filter(compound %in% c("C6H9", "C5H9", "C6H11O", "C5H11")) %>%
+  mutate(test.ae = ro.13C.value.ae * 1000) %>%
+  merge(., sample_info[, c(1, 3, 4)], by = "filename") %>%
+  mutate(
+    compound_file = paste0(compound, " | ", filename),
+    compound_file = factor(compound_file, levels = s_ro.corr %>%
+                             arrange(compound, filename) %>%
+                             distinct(compound, filename) %>%
+                             mutate(cf = paste0(compound, " | ", filename)) %>%
+                             pull(cf)),
+    session = case_when(
+      filename %in% c("H2210023", "H2210027", "H2210046",
+                      "H2210032", "H2210034", "H2210049",
+                      "H2210051", "H2210057") ~ 1,
+      filename %in% c("H2307071", "H2307083", "H2307093",
+                      "H2307074", "H2307085", "H2307095") ~ 2
+    )
+  )
+
+ggplot(precision_1,
+       aes(x = compound_file, y = ro.13C.value, colour = as.factor(ID))) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = ro.13C.value - ro.13C.value.ae, 
+                    ymax = ro.13C.value + ro.13C.value.ae),
+                width = 0.2, colour = "black") +
+  theme_bw() +
+  scale_y_continuous(
+    breaks = function(limits) seq(
+      from = floor(limits[1] / 0.005) * 0.005,
+      to = ceiling(limits[2] / 0.005) * 0.005,
+      by = 0.005
+    ),
+    labels = scales::number_format(accuracy = 0.0001)
+  ) +
+  theme(axis.text.x = element_text(angle = 15, vjust = 0.7)) +
+  facet_wrap(~Group, scales = "free", nrow = 4)
+```
+
+### 5.10 Output rho Tables and Figures
+
+```{r output-supp-II}
+# Supplementary Table II
+supp.II_1 <- s_ro.corr %>%
+  select(filename, compound, ID, ro.13C.ae, ro.13C.value.ae, ro.13C.value, shotnoise.C) %>%
+  filter(filename == "H2210046", grepl("O", compound)) %>%
+  mutate(
+    AE_SNL = ro.13C.value.ae / shotnoise.C,
+    ae = ro.13C.value.ae * 1000
+  )
+
+supp.II_2 <- s_ro.corr %>%
+  select(filename, compound, ID, ro.13C.ae, ro.13C.value.ae, ro.13C.value, shotnoise.C) %>%
+  filter(filename == "H2210046", !grepl("O", compound)) %>%
+  mutate(
+    AE_SNL = ro.13C.value.ae / shotnoise.C,
+    ae = ro.13C.value.ae * 1000
+  )
+
+write.xlsx(supp.II_1, "output/supp.II_1.xlsx")
+write.xlsx(supp.II_2, "output/supp.II_2.xlsx")
+```
+
+### 5.11 Sample-STD bracketing
+
+```{r output-fig6, fig.height=7, fig.width=6}
+# Figure 6 - Sample vs Standard comparison
+comp.STD.sample <- s_ro.corr %>%
+  filter(!ID == "STD") %>%
+  select(filename, compound, DoU, Group, element, method, date, replicate, ID, n.C,
+         ro.13C.value, ro.13C.value.ae, U.13C.f, U.13C.f.ae, U.13C.f.se) %>%
+  merge(
+    s_ro.corr %>% filter(ID == "STD") %>% filter(!filename == "H2210023") %>%
+      select(filename, compound, date, ro.13C.value, ro.13C.value.ae, U.13C.f, U.13C.f.ae),
+    by = c("date", "compound"),
+    suffixes = c("", ".std")
+  ) %>%
+  rename(ro.13C.std = ro.13C.value.std, 
+         ro.13C.std.ae = ro.13C.value.ae.std) %>%
+  mutate(
+    ratio_to_STD = ((U.13C.f / U.13C.f.std) - 1) * 1000,
+    R.ae = (U.13C.f / U.13C.f.std) * sqrt(U.13C.f.ae^2 + U.13C.f.ae.std^2),
+    ratio_to_STD.ae = R.ae * 1000
+  )
+
+m.comp <- comp.STD.sample %>%
+  group_by(ID, compound, Group) %>%
+  summarise(
+    m.delta = mean(ratio_to_STD, na.rm = TRUE),
+    sd.delta = sd(ratio_to_STD, na.rm = TRUE),
+    se.m.delta = sqrt(sum(ratio_to_STD.ae^2, na.rm = TRUE)) / n(),  # This was missing
+    sem.delta = sd(ratio_to_STD, na.rm = TRUE) / sqrt(n()),
+    count = n(),
+    .groups = "drop"
+  )
+
+rep.median =comp.STD.sample%>%group_by(ID,Group)%>%
+  summarise(
+    median.sd=median(sd(ratio_to_STD))
+  )
+mol.median =m.comp%>%group_by(ID)%>%
+  summarise(
+    median.sd=median(m.delta)
+  )
+
+ggplot(m.comp,
+       aes(x=compound,y=m.delta, colour=as.factor(ID)))+
+  geom_point(data = comp.STD.sample,
+             aes(x = compound, y =ratio_to_STD, colour = ID),
+             size = 3, shape = 18, inherit.aes = FALSE,
+             alpha = 0.3) +  # per sample/std points
+  geom_errorbar(data = comp.STD.sample,
+                aes(x = compound, ymin=ratio_to_STD-ratio_to_STD.ae, ymax=ratio_to_STD+ratio_to_STD.ae,colour = ID),
+                inherit.aes = FALSE,width = 0.2, alpha = 0.5) +  # error bars
+  geom_point(data=m.comp, size=3)+
+  geom_errorbar(data=m.comp, 
+                aes(ymin=m.delta-sd.delta, ymax=m.delta+sd.delta), width=.2, colour="black")+
+  theme_bw()+
+  labs(title = expression("U13C precursor not reconstructed"))+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.7))+
+  facet_wrap(~ factor(Group, levels = c("Mono-unsaturated", 
+                                        "Di-unsaturated (Non-oxygenated)", 
+                                        "Di-unsaturated (Oxygenated)", 
+                                        "Tri-unsaturated")),
+             scales = "free", nrow = 2) +
+  theme(axis.text.x = element_text(angle = 60, vjust = 0.7),
+        legend.position = "bottom")
+ggsave("output/fig6.pdf", width = 6, height = 7)
+```
+
+### 5.12 Sample-STD tables output
+
+```{r output-tables}
+# Output tables
+output_table_wide <- comp.STD.sample %>%
+  select(ID, compound, filename, ratio_to_STD, ratio_to_STD.ae) %>%
+  group_by(compound) %>%
+  mutate(replicate = as.integer(factor(filename, levels = unique(filename)))) %>%
+  ungroup() %>%
+  mutate(
+    ratio_to_STD.ae = abs(ratio_to_STD.ae),
+    formatted_value = sprintf("%.1f ± %.1f", 
+                              round(ratio_to_STD, 1), 
+                              round(ratio_to_STD.ae, 1))
+  ) %>%
+  mutate(compound = factor(compound, 
+                           levels = c("C4H7", "C4H7O", "C4H9", "C5H7", "C5H9", "C5H9O",
+                                      "C5H11", "C6H9", "C6H11", "C6H11O", "C6H13",
+                                      "C7H11", "C7H13", "C7H13O","C7H15", "C8H13", "C8H15", "C8H15O", "C9H15", "C9H17",
+                                      "C10H17", "C10H19", "C11H19", "C12H21", "C13H23", "C14H25"))) %>%
+  select(-ratio_to_STD, -ratio_to_STD.ae, -filename) %>%
+  pivot_wider(
+    names_from = ID,
+    values_from = formatted_value,
+    names_prefix = "delta_"
+  ) %>%
+  arrange(compound, replicate)
+
+output_comp_wide <- m.comp %>%
+  select(ID, compound, m.delta, se.m.delta, sem.delta) %>%
+  ungroup() %>%
+  mutate(
+    sem.delta = abs(sem.delta),
+    formatted_value = sprintf("%.1f ± %.1f", 
+                              round(m.delta, 1), 
+                              round(sem.delta, 1))
+  ) %>%
+  mutate(compound = factor(compound, 
+                           levels = c("C4H7", "C4H7O", "C4H9", "C5H7", "C5H9", "C5H9O",
+                                      "C5H11", "C6H9", "C6H11", "C6H11O", "C6H13",
+                                      "C7H11", "C7H13", "C7H13O", "C7H15", "C8H13",
+                                      "C8H15", "C8H15O", "C9H15", "C9H17",
+                                      "C10H17", "C10H19", "C11H19", "C12H21", "C13H23"))) %>%
+  select(-m.delta, -se.m.delta, -sem.delta) %>%
+  pivot_wider(
+    names_from = ID,
+    values_from = formatted_value,
+    names_prefix = "delta_"
+  ) %>%
+  arrange(compound)
+
+
+write.xlsx(output_table_wide, "output/output_table_wide.xlsx")
+write.xlsx(output_comp_wide, "output/output_comp_wide.xlsx")
+
+# Display first few rows to verify
+print("Output Table Wide (first 20 rows):")
+print(head(output_table_wide, 20))
+
+print("Output Compound Summary (first 20 rows):")
+print(head(output_comp_wide, 20))
+```
+
+### 5.13 Day-to-Day Variability Analysis
+
+
+```{r day-to-day-variability, fig.height=6, fig.width=8}
+# Calculate daily means
+daily_means <- comp.STD.sample %>%
+  group_by(ID, compound, Group, date) %>%
+  summarise(
+    daily_mean = mean(ratio_to_STD, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Calculate between-day standard deviation
+day_to_day_sd <- daily_means %>%
+  group_by(ID, compound, Group) %>%
+  summarise(
+    sd_between_day = sd(daily_mean, na.rm = TRUE),
+    n_days = n(),
+    .groups = "drop"
+  )
+
+# Median between-day variability by sample type
+median_sd <- day_to_day_sd %>%
+  group_by(ID) %>%
+  summarise(
+    median.sd = median(sd_between_day, na.rm = TRUE)
+  )
+print("Median between-day SD by sample type:")
+print(median_sd)
+
+# Mean between-day variability by group
+group_day_variability <- day_to_day_sd %>%
+  group_by(ID, Group) %>%
+  summarise(
+    mean_between_day_sd = mean(sd_between_day, na.rm = TRUE),
+    .groups = "drop"
+  )
+print("Mean between-day SD by fragment group:")
+print(group_day_variability)
+
+# Mixed-effects model for Spinach
+sp_data <- comp.STD.sample %>% filter(ID == "Spinach")
+if(nrow(sp_data) > 0) {
+  mod_sp <- lmer(ratio_to_STD ~ 1 + (1 | date) + (1 | compound),
+                 data = sp_data, REML = TRUE)
+  
+  vc_sp <- as.data.frame(VarCorr(mod_sp)) %>%
+    select(grp, vcov) %>%
+    mutate(
+      Component = case_when(
+        grp == "date" ~ "Inter-day",
+        grp == "compound" ~ "Fragment",
+        grp == "Residual" ~ "Residual",
+        TRUE ~ grp
+      ),
+      percent = 100 * vcov / sum(vcov)
+    )
+  
+  # Variance partitioning plot for Spinach
+  p_spinach <- ggplot(vc_sp, aes(x = Component, y = percent)) +
+    geom_col(width = 0.6, fill = "#0072B2") +
+    geom_text(aes(label = sprintf("%.2f%%", percent)),
+              vjust = -0.5, size = 4) +
+    theme_bw() +
+    labs(x = "Variance component",
+         y = "Contribution to total variance (%)",
+         title = expression("Variance partitioning of " *
+                              delta^{13} * "C"[sample-STD] * " (Spinach)"))
+  
+  print(p_spinach)
+}
+
+# Mixed-effects model for CHLA
+chla_data <- comp.STD.sample %>% filter(ID == "CHLA")
+if(nrow(chla_data) > 0) {
+  mod_chla <- lmer(ratio_to_STD ~ 1 + (1 | date) + (1 | compound),
+                   data = chla_data, REML = TRUE)
+  
+  vc_chla <- as.data.frame(VarCorr(mod_chla)) %>%
+    select(grp, vcov) %>%
+    mutate(
+      Component = case_when(
+        grp == "date" ~ "Inter-day",
+        grp == "compound" ~ "Fragment",
+        grp == "Residual" ~ "Residual",
+        TRUE ~ grp
+      ),
+      percent = 100 * vcov / sum(vcov)
+    )
+  
+  # Variance partitioning plot for CHLA
+  p_chla <- ggplot(vc_chla, aes(x = Component, y = percent)) +
+    geom_col(width = 0.6, fill = "#0072B2") +
+    geom_text(aes(label = sprintf("%.2f%%", percent)),
+              vjust = -0.5, size = 4) +
+    theme_bw() +
+    labs(x = "Variance component",
+         y = "Contribution to total variance (%)",
+         title = expression("Variance partitioning of " *
+                              delta^{13} * "C"[sample-STD] * " (CHLA)"))
+  
+  print(p_chla)
+}
+```
+
+### 5.14 Heterogeneous vs. Homogeneous modelling
+
+hypothesis testing of intra-molecular heterogeneity
+
+```{r modelling data}
+# Figure 4 - Heterogeneous vs Homogeneous Model comparison
+
+# Fragment definitions for the model
+carbon_positions <- paste0("C", 1:20)
+
+fragment_definitions <- list(
+  C4H7 = c("C16", "C15", "C14", "C20"),
+  C4H9 = c("C16", "C15", "C14", "C20"),
+  C4H7O = c("C1", "C2", "C3", "C17"),
+  C5H7 = c("C1", "C2", "C3", "C17", "C4"),
+  C5H9 = c("C16", "C15", "C14", "C20", "C13"),
+  C5H11 = c("C16", "C15", "C14", "C20", "C13"),
+  C5H9O = c("C1", "C2", "C3", "C17", "C4"),
+  C6H9 = c("C1", "C2", "C3", "C17", "C4", "C5"),
+  C6H11 = c("C16", "C15", "C14", "C20", "C13", "C12"),
+  C6H13 = c("C16", "C15", "C14", "C20", "C13", "C12"),
+  C6H11O = c("C1", "C2", "C3", "C17", "C4", "C5"),
+  C7H11 = c("C1", "C2", "C3", "C17", "C4", "C5", "C6"),
+  C7H13 = c("C16", "C15", "C14", "C13", "C12", "C11", "C20"),
+  C7H15 = c("C16", "C15", "C14", "C13", "C12", "C11", "C20"),
+  C7H13O = c("C1", "C2", "C3", "C17", "C4", "C5", "C6"),
+  C8H13 = c("C1", "C2", "C3", "C17", "C4", "C5", "C6", "C7"),
+  C8H15 = c("C16", "C15", "C14", "C13", "C12", "C11", "C19", "C20"),
+  C8H15O = c("C1", "C2", "C3", "C17", "C4", "C5", "C6", "C7"),
+  C9H15 = c("C1", "C2", "C3", "C17", "C4", "C5", "C6", "C7", "C18"),
+  C9H17 = c("C16", "C15", "C14", "C13", "C12", "C11", "C19", "C20", "C10"),
+  C10H17 = c("C1", "C2", "C3", "C17", "C4", "C5", "C6", "C7", "C18", "C8"),
+  C10H19 = c("C16", "C15", "C14", "C13", "C12", "C11", "C19", "C20", "C10", "C9"),
+  C11H19 = c("C1", "C2", "C3", "C17", "C4", "C5", "C6", "C7", "C18", "C8", "C9"),
+  C12H21 = c("C1", "C2", "C3", "C17", "C4", "C5", "C6", "C7", "C18", "C8", "C9", "C10"),
+  C13H23 = c("C1", "C2", "C3", "C17", "C4", "C5", "C6", "C7", "C18", "C8", "C9", "C10", "C11"),
+  C14H25 = c("C1", "C2", "C3", "C17", "C4", "C5", "C6", "C7", "C18", "C8", "C9", "C10", "C11", "C12")
+)
+
+# Prepare observed data
+observed <- s_ro.corr[, c("filename", "compound", "ro.13C.value", "ro.13C.value.ae", "ro.13C.homo", "ro.13C.homo.ae")] %>%
+  merge(., sample_info[, 1:2], by = "filename")
+
+# Function to solve for position-specific values
+process_sum_model <- function(df_group, fragment_definitions) {
+  
+  observed_values <- df_group$ro.13C.value
+  names(observed_values) <- df_group$compound
+  
+  ae_values <- df_group$ro.13C.value.ae
+  names(ae_values) <- df_group$compound
+  
+  valid_fragments <- intersect(names(fragment_definitions), df_group$compound)
+  observed_values <- observed_values[valid_fragments]
+  ae_values <- ae_values[valid_fragments]
+  fragment_definitions <- fragment_definitions[valid_fragments]
+  
+  A_sum <- matrix(
+    0,
+    nrow = length(valid_fragments),
+    ncol = 20,
+    dimnames = list(valid_fragments, carbon_positions)
+  )
+  
+  for (fragment in valid_fragments) {
+    A_sum[fragment, fragment_definitions[[fragment]]] <- 1
+  }
+  
+  weights <- 1 / (ae_values^2)
+  
+  solution_sum <- lm(observed_values ~ A_sum + 0, weights = weights)
+  
+  position_specific_13C_sum <- coef(solution_sum)
+  names(position_specific_13C_sum) <- carbon_positions
+  
+  V <- vcov(solution_sum)
+  V[is.na(V)] <- 0
+  
+  position_specific_13C_ae <- sqrt(diag(V))
+  names(position_specific_13C_ae) <- carbon_positions
+  
+  position_specific_13C_sum_noNA <- position_specific_13C_sum
+  position_specific_13C_sum_noNA[is.na(position_specific_13C_sum_noNA)] <- 0
+  
+  position_specific_13C_ae_noNA <- position_specific_13C_ae
+  position_specific_13C_ae_noNA[is.na(position_specific_13C_ae_noNA)] <- NA
+  
+  # Apply group constraints
+  grp1 <- c("C1", "C2", "C3", "C17")
+  grp2 <- c("C14", "C15", "C16", "C20")
+  
+  apply_group_constraint <- function(vals, V, grp) {
+    idx <- match(grp, names(vals))
+    mean_val <- mean(vals[idx])
+    ae_val <- sqrt(sum(V[idx, idx]) / length(idx)^2)
+    list(value = mean_val, ae = ae_val)
+  }
+  
+  g1 <- apply_group_constraint(position_specific_13C_sum_noNA, V, grp1)
+  g2 <- apply_group_constraint(position_specific_13C_sum_noNA, V, grp2)
+  
+  position_specific_13C_sum_noNA[grp1] <- g1$value
+  position_specific_13C_sum_noNA[grp2] <- g2$value
+  
+  position_specific_13C_ae_noNA[grp1] <- g1$ae
+  position_specific_13C_ae_noNA[grp2] <- g2$ae
+  
+  data.frame(
+    carbon_position = carbon_positions,
+    ro.13C_est = position_specific_13C_sum_noNA,
+    ro.13C_ae = position_specific_13C_ae_noNA
+  )
+}
+
+# Apply model per sample
+data_list <- observed %>% group_by(filename) %>% group_split()
+names(data_list) <- sapply(data_list, function(x) unique(x$filename))
+results <- lapply(data_list, process_sum_model, fragment_definitions = fragment_definitions)
+
+# Convert results to data frame
+results_df <- bind_rows(
+  lapply(names(results), function(fname) {
+    cbind(filename = fname, results[[fname]])
+  })
+) %>%
+  mutate(carbon_position = factor(carbon_position, levels = paste0("C", 1:20))) %>%
+  arrange(filename, carbon_position) %>%
+  merge(sample_info[, 1:2], by = "filename")
+```
+
+```{r output-mol-plot, fig.height=5, fig.width=7}
+# Molecular plot for STD (Figure STD_2)
+atom.13C <- results_df %>%
+  group_by(filename) %>%
+  mutate(
+    mean_ro = mean(ro.13C_est),
+    ae_mean = sqrt(sum(ro.13C_ae^2, na.rm = TRUE)) / n(),
+    rel.to.averg.value = (ro.13C_est - mean_ro) / mean_ro * 100,
+    error.rel.to.averg.value = (100 / mean_ro) *
+      sqrt(ro.13C_ae^2 + (ro.13C_est / mean_ro)^2 * ae_mean^2)
+  ) %>%
+  ungroup() %>%
+  filter(filename %in% c("H2210046"))
+
+# Coordinates for molecular plot
+atom.13C.coords <- atom.13C %>%
+  mutate(
+    y.coord = c(2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 3, 3, 3, 3),
+    x.coord = c(16:1, 14, 10, 6, 2)
+  )
+
+mol <- ggplot(atom.13C.coords, 
+              aes(x = x.coord, y = y.coord, fill = ro.13C_est * 1000)) + 
+  geom_point(shape = 21, size = 3) +
+  geom_text(aes(label = paste0(
+    round(ro.13C_est * 1000, 1), "\n±",
+    round(ro.13C_ae * 1000, 1))), 
+    vjust = 0.5, size = 3) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       midpoint = mean(atom.13C.coords$ro.13C_est * 1000),
+                       limits = range(atom.13C.coords$ro.13C_est * 1000)) +
+  theme_minimal() +
+  labs(title = "Phytol Carbon Isotopic Deviation (STD)", 
+       fill = expression(paste(rho^{13}, "C (permil)"))) +
+  theme(legend.position = "bottom")
+
+mol
+ggsave("output/fig5.STD.pdf", width = 7, height = 5)
+```
+
+```{r output-fig4, fig.height=4, fig.width=8}
+# Calculate fragment sums from position-specific results
+fragment_mapping <- tibble(
+  fragment = rep(names(fragment_definitions), lengths(fragment_definitions)),
+  carbon_position = unlist(fragment_definitions)
+)
+
+fragment_sums <- results_df %>%
+  inner_join(fragment_mapping, by = "carbon_position", relationship = "many-to-many") %>%
+  group_by(filename, ID, fragment) %>%
+  summarise(
+    ro.13C.hetero = sum(ro.13C_est, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(fragment = factor(fragment, levels = names(fragment_definitions))) %>%
+  arrange(filename, fragment)
+
+# Merge with observed data
+results_fragment <- s_ro.corr %>%
+  rename(fragment = compound) %>%
+  merge(., fragment_sums, by = c("filename", "fragment", "ID")) %>%
+  mutate(
+    residual = ro.13C.value - ro.13C.hetero,
+    relative_error = residual / ro.13C.value,
+    DoU = ((2 * n.C + 2) - (n.H + 1)) / 2,
+    Group = case_when(
+      DoU == 0 ~ "Mono-unsaturated",
+      DoU == 1 & grepl("O$", fragment) ~ "Di-unsaturated (Oxygenated)",
+      DoU == 1 ~ "Di-unsaturated (Non-oxygenated)",
+      DoU == 2 ~ "Tri-unsaturated"
+    ),
+    element = ifelse(grepl("O", fragment), "O", "C")
+  ) %>%
+  filter(filename %in% c("H2210046"))
+
+# Figure 4 - Model comparison
+level_all <- c("C4H7", "C4H7O", "C4H9", "C5H7", "C5H9", "C5H9O", "C5H11", 
+               "C6H9", "C6H11", "C6H11O", "C6H13", "C7H11", "C7H13", "C7H13O", 
+               "C7H15", "C8H13", "C8H15", "C8H15O", "C9H15", "C9H17",
+               "C10H17", "C10H19", "C11H19", "C12H21", "C13H23", "C14H25")
+
+plot.data <- results_fragment %>%
+  filter(filename %in% c("H2210046"), fragment %in% level_all)
+
+fig4 <- ggplot(plot.data,
+       aes(x = factor(fragment, levels = level_all), y = ro.13C.value, colour = Group)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = ro.13C.value - ro.13C.value.ae, 
+                    ymax = ro.13C.value + ro.13C.value.ae),
+                width = 0.2, color = "black") +
+  geom_point(aes(y = ro.13C.homo), shape = 2, size = 3) +
+  geom_point(aes(y = ro.13C.hetero), shape = 22, size = 3) +
+  scale_color_manual(values = c("Mono-unsaturated" = "#D55E00", 
+                                 "Di-unsaturated (Non-oxygenated)" = "#009E73",
+                                 "Di-unsaturated (Oxygenated)" = "#1F604E", 
+                                 "Tri-unsaturated" = "#56B4E9")) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.7),
+        legend.position = "bottom") +
+  labs(x = "Fragments", y = expression(rho^{13}*C))
+
+fig4
+ggsave("output/fig4.pdf", width = 8, height = 4)
+```
+
+```{r output-fig4.b, fig.height=3, fig.width=7}
+# Figure 4B - Relative differences
+rel.diff.results_fragment <- results_fragment %>%
+  mutate(
+    residual.hetero = ro.13C.value - ro.13C.hetero,
+    residual.homo = ro.13C.value - ro.13C.homo
+  ) %>%
+  select(ID, Group, fragment, ro.13C.value, ro.13C.value.ae, 
+         ro.13C.homo, ro.13C.hetero, residual.hetero, residual.homo) %>%
+  pivot_longer(
+    cols = c(residual.hetero, residual.homo),
+    names_to = c(".value", "Model"),
+    names_pattern = "(residual)\\.(hetero|homo)"
+  ) %>%
+  rename(Abs_Offset = residual) %>%
+  mutate(
+    Model = case_when(
+      Model == "hetero" ~ "Heterogeneous",
+      Model == "homo" ~ "Homogeneous"
+    )
+  )
+
+fig4b <- ggplot(rel.diff.results_fragment %>%
+         filter(ID == "STD", fragment %in% level_all), 
+       aes(y = abs(Abs_Offset), x = fragment, fill = Group)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.9), 
+           aes(alpha = Model)) +
+  scale_alpha_manual(values = c("Heterogeneous" = 1, "Homogeneous" = 0.50)) +
+  labs(
+    title = "Model Fit by Offset from Observed 13C",
+    y = expression(Delta*rho^{13}*C[obs-corr]),
+    x = "Fragment"
+  ) +
+  theme_bw() +
+  facet_wrap(~ factor(Group, levels = c("Mono-unsaturated", 
+                                        "Di-unsaturated (Non-oxygenated)",
+                                        "Di-unsaturated (Oxygenated)", 
+                                        "Tri-unsaturated")),
+             scales = "free_x", nrow = 1) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.7),
+        axis.title.x = element_blank(),
+        legend.position = "none") +
+  scale_fill_manual(values = c("#009E73", "#1F604E", "#D55E00", "#56B4E9"))
+
+fig4b
+ggsave("output/fig4.B.pdf", width = 9, height = 3)
+```
+
+## 6. Session Information
+
+```{r session-info}
+sessionInfo()
+```
+

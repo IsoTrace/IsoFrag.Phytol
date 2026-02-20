@@ -1,6 +1,4 @@
 #Compound	Isotopolog	m/z	Tolerance [mmu]	z
-cont2	M0	296.26737	2	1
-cont1	M0	296.33118	2	1
 C20H39O	M0	295.29954	2	1
 C20H39O	13C	296.30290	2	1
 C20H39O	2H	296.30582	2	1

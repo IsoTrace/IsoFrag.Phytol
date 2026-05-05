@@ -2,7 +2,7 @@
 # Phytol Orbitrap Isotopologue Processing Pipeline
 
 This repository contains a minimal reproducible pipeline for processing Orbitrap MS2 isotopologue data of phytol fragments.  
-It implements the workflow described in *DOI*.
+It implements the workflow described in [*DOI*](https://doi.org/10.1021/acsomega.5c10946).
 
 ## Contents
 - `phytol_processing.Rmd`: R Markdown script reproducing the key steps:
@@ -28,4 +28,6 @@ It implements the workflow described in *DOI*.
 
 2. If you use this code, please cite:
 [DOI]
+Tomečková Öztoprak et al. 2026
+and
 Kantnerová et al. 2024 (IsoOrbi R package)
